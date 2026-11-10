@@ -12,6 +12,7 @@
 #include "database.h"
 #include "messaging.h"
 #include "http.h"
+#include "tls.h"
 
 #include <stdio.h>
 #include <stdbool.h>
@@ -47,6 +48,7 @@ struct listener
 	size_t port_index;
 	struct banner_pool const *banners;
 	FILE *log_file;
+	bool tls_inspection;
 };
 
 struct connection_event
@@ -212,6 +214,7 @@ void capture_timestamp(char *buffer, size_t buffer_size)
 enum connection_result handle_connection(
 	int cfd,
 	const struct listener *listener,
+	SSL_CTX *tls_ctx,
 	sqlite3 *db,
 	natsConnection *nats_connection,
 	const char *sensor_name,
@@ -226,7 +229,9 @@ enum connection_result handle_connection(
 	capture_timestamp(event.timestamp, sizeof event.timestamp);
 	capture_timestamp_utc(event.timestamp_utc, sizeof event.timestamp_utc);
 
-	const char *banner = choose_banner(listener->banners);
+	const char *banner = listener->tls_inspection
+		? NULL
+		: choose_banner(listener->banners);
 	if(banner != NULL)
 	{
 		if(send_banner(cfd, banner))
@@ -256,18 +261,37 @@ enum connection_result handle_connection(
 		return CONNECTION_FATAL;
 	}
 
-	if(!set_receive_timeout(cfd))
-	{
-		close(cfd);
-		return CONNECTION_FATAL;
-	}
+	struct tls_hello_info tls_info = {0};
+	bool tls_seen = false;
 
-	enum receive_status payload_result =
-	receive_payload(
-		cfd,
-		event.payload,
-		sizeof event.payload,
-		&event.payload_len);
+	enum receive_status payload_result = RECEIVE_DATA;
+	event.payload_len = 0;
+	event.payload[0] = '\0';
+
+	if (listener->tls_inspection)
+	{
+		if (tls_ctx == NULL)
+		{
+			close(cfd);
+			return CONNECTION_FATAL;
+		}
+
+		tls_seen = tls_inspect_client_hello(tls_ctx, cfd, &tls_info);
+	}
+	else
+	{
+		if (!set_receive_timeout(cfd))
+		{
+			close(cfd);
+			return CONNECTION_FATAL;
+		}
+
+		payload_result = receive_payload(
+			cfd,
+			event.payload,
+			sizeof event.payload,
+			&event.payload_len);
+	}
 
 	if(payload_result == RECEIVE_INTERRUPTED)
 	{
@@ -287,7 +311,7 @@ enum connection_result handle_connection(
 	char user_agent[256];
 	bool has_user_agent = false;
 
-	if(payload_result == RECEIVE_DATA)
+	if (!listener->tls_inspection && payload_result == RECEIVE_DATA)
 	{
 		has_user_agent = extract_http_user_agent(
 			event.payload,
@@ -428,7 +452,39 @@ enum connection_result handle_connection(
 		printf("           user-agent: %s\n", user_agent);
 	}
 
-	if(payload_result == RECEIVE_DATA)
+	if (listener->tls_inspection)
+	{
+		printf("           tls-clienthello: %s\n",
+			tls_seen ? "seen" : "not observed");
+
+		if (tls_seen)
+		{
+			printf("           sni: %s\n",
+				tls_info.sni[0] ? tls_info.sni : "<absent>");
+
+			printf("           legacy-version: 0x%04x\n",
+				tls_info.legacy_version);
+				
+			printf("           offered-versions:");
+
+			if (tls_info.version_count == 0)
+			{
+				printf(" <absent>");
+			}
+			else
+			{
+				for (size_t i = 0; i < tls_info.version_count; i++)
+				{
+					printf(" 0x%04x", (unsigned int)tls_info.versions[i]);
+				}
+			}
+
+			printf("\n");
+			printf("           offered-alpn: %s\n",
+				tls_info.alpn[0] ? tls_info.alpn : "<absent>");
+		}
+	}
+	else if (payload_result == RECEIVE_DATA)
 	{
 		printf("           payload: ");
 		print_payload(stdout, event.payload, event.payload_len);
@@ -452,15 +508,80 @@ enum connection_result handle_connection(
 
 	close(cfd);
 
-	log_connection(
-		listener->log_file,
-		log_buffer,
-		event.payload,
-		event.payload_len,
-		payload_result,
-		banner,
-		banner_sent,
-		has_user_agent ? user_agent : NULL);
+	if (listener->tls_inspection)
+	{
+		int written = fprintf(
+			listener->log_file,
+			"%s\n"
+			"- banner: <none>\n"
+			"- tls-clienthello: %s\n",
+			log_buffer,
+			tls_seen ? "seen" : "not observed");
+
+		if (tls_seen)
+		{
+			if (fprintf(
+				listener->log_file,
+				"- sni: %s\n"
+				"- legacy-version: 0x%04x\n",
+				tls_info.sni[0] ? tls_info.sni : "<absent>",
+				tls_info.legacy_version) < 0)
+			{
+				written = -1;
+			}
+		}
+		
+		if (tls_seen && written >= 0)
+		{
+			if (fprintf(listener->log_file, "- offered-versions:") < 0)
+				written = -1;
+
+			if (tls_info.version_count == 0)
+			{
+				if (fprintf(listener->log_file, " <absent>") < 0)
+					written = -1;
+			}
+			else
+			{
+				for (size_t i = 0; i < tls_info.version_count; i++)
+				{
+					if (fprintf(listener->log_file, " 0x%04x",
+						(unsigned int)tls_info.versions[i]) < 0)
+					{
+						written = -1;
+						break;
+					}
+				}
+			}
+
+			// Finish the offered-versions line.
+			if (written >= 0 && fputc('\n', listener->log_file) == EOF)
+				written = -1;
+
+			// Write ALPN exactly once, on its own line.
+			if (written >= 0 &&
+				fprintf(listener->log_file, "- offered-alpn: %s\n",
+					tls_info.alpn[0] ? tls_info.alpn : "<absent>") < 0)
+			{
+				written = -1;
+			}
+		}
+
+		if (written < 0 || fflush(listener->log_file) != 0)
+			perror("TLS connection log");
+	}
+	else
+	{
+		log_connection(
+			listener->log_file,
+			log_buffer,
+			event.payload,
+			event.payload_len,
+			payload_result,
+			banner,
+			banner_sent,
+			has_user_agent ? user_agent : NULL);
+	}
 
 	return CONNECTION_OK;
 }
@@ -497,7 +618,28 @@ int main (int argc, char *argv[])
 		return EXIT_FAILURE;
 	}
 
-        // Restrict listeners to the requested address family.
+	uint16_t tls_port = 0;
+	const char *tls_port_env = getenv("TCPNOISE_TLS_PORT");
+
+	if (tls_port_env != NULL && tls_port_env[0] != '\0')
+	{
+		char *end;
+		errno = 0;
+
+		long value = strtol(tls_port_env, &end, 10);
+
+		if (errno != 0 || end == tls_port_env || *end != '\0' ||
+			value < 1 || value > 65535 ||
+			!uint16_exists(ports, port_count, (uint16_t)value))
+		{
+			fprintf(stderr, "Invalid TCPNOISE_TLS_PORT: %s\n", tls_port_env);
+			return EXIT_FAILURE;
+		}
+
+		tls_port = (uint16_t)value;
+	}
+
+    // Restrict listeners to the requested address family.
 	// Without --bind, retain the original IPv4 + IPv6 behavior.
 	if (bind_family != AF_UNSPEC)
 	{
@@ -586,6 +728,7 @@ int main (int argc, char *argv[])
 			listeners[listener_index].fd = create_socket(listeners[listener_index].family);
 			listeners[listener_index].banners = &banner_pools[i];
 			listeners[listener_index].log_file = log_files[i];
+			listeners[listener_index].tls_inspection = (ports[i] == tls_port);
 
 			if (listeners[listener_index].fd < 0)
 			{
@@ -659,6 +802,30 @@ int main (int argc, char *argv[])
 
 	natsConnection *nats_connection = messaging_connect(nats_url);
 
+	SSL_CTX *tls_ctx = NULL;
+
+	if (tls_port != 0)
+	{
+		tls_ctx = SSL_CTX_new(TLS_server_method());
+
+		if (tls_ctx == NULL)
+		{
+			fprintf(stderr, "Failed to initialize TLS context\n");
+
+			messaging_disconnect(nats_connection);
+			database_close(db);
+			close_log_files(log_files, port_count);
+			free_banner_pools(banner_pools, port_count);
+			close_listeners(listeners, listener_count);
+
+			return EXIT_FAILURE;
+		}
+
+		tls_register_client_hello_callback(tls_ctx);
+
+		printf("TLS ClientHello inspection enabled on port %" PRIu16 "\n", tls_port);
+	}
+
 	// Main loop
 	while (running) {
 		int num_selected = poll(pollfds, listener_count, -1);
@@ -697,6 +864,7 @@ int main (int argc, char *argv[])
 					close_log_files(log_files, port_count);
 					free_banner_pools(banner_pools, port_count);
 					close_listeners(listeners, listener_count);
+					SSL_CTX_free(tls_ctx);
 					return EXIT_FAILURE;
 				}
 				size_t port_index = listeners[i].port_index;
@@ -706,6 +874,7 @@ int main (int argc, char *argv[])
 					handle_connection(
 						cfd,
 						&listeners[i],
+						tls_ctx,
 						db,
 						nats_connection,
 						sensor_name,
@@ -723,6 +892,7 @@ int main (int argc, char *argv[])
 					close_log_files(log_files, port_count);
 					free_banner_pools(banner_pools, port_count);
 					close_listeners(listeners, listener_count);
+					SSL_CTX_free(tls_ctx);
 					return EXIT_FAILURE;
 				}
 			}
@@ -730,6 +900,7 @@ int main (int argc, char *argv[])
 	}
 
 	messaging_disconnect(nats_connection);
+	SSL_CTX_free(tls_ctx);
 	close_listeners(listeners, listener_count);
 	close_log_files(log_files, port_count);
 

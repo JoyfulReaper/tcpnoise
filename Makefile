@@ -7,10 +7,13 @@ SQLITE_LIBS != pkg-config --libs sqlite3
 NATS_CFLAGS != pkg-config --cflags libnats
 NATS_LIBS != pkg-config --libs libnats
 
-CFLAGS += ${SQLITE_CFLAGS} ${NATS_CFLAGS}
-LDLIBS += ${SQLITE_LIBS} ${NATS_LIBS}
+OPENSSL_CFLAGS != pkg-config --cflags openssl
+OPENSSL_LIBS != pkg-config --libs openssl
 
-SRC = src/main.c src/banner.c src/logging.c src/network.c src/database.c src/messaging.c src/http.c
+CFLAGS += ${SQLITE_CFLAGS} ${NATS_CFLAGS} ${OPENSSL_CFLAGS}
+LDLIBS += ${SQLITE_LIBS} ${NATS_LIBS} ${OPENSSL_LIBS}
+
+SRC = src/main.c src/banner.c src/logging.c src/network.c src/database.c src/messaging.c src/http.c src/tls.c
 OBJ = ${SRC:.c=.o}
 
 tcpnoise: ${OBJ}
@@ -24,5 +27,7 @@ test:
 	/tmp/tcpnoise-http-test
 	${CC} ${CFLAGS} src/network.c src/http.c tests/network_test.c -o /tmp/tcpnoise-network-test
 	/tmp/tcpnoise-network-test
+	${CC} ${CFLAGS} src/tls.c tests/tls_test.c -o /tmp/tcpnoise-tls-test ${OPENSSL_LIBS}
+	/tmp/tcpnoise-tls-test
 
 .PHONY: clean test
